@@ -1,0 +1,11 @@
+{
+  "id": "QuickPlay",
+  "name": "QuickPlay",
+  "author": "You",
+  "description": "Optimizes card play: click to auto-play when only one enemy, auto-target last enemy, quick potion use on single target.",
+  "version": "1.0.0",
+  "has_pck": false,
+  "has_dll": true,
+  "dependencies": [],
+  "affects_gameplay": false
+}
