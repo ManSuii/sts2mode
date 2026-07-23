@@ -38,7 +38,7 @@ internal static class ClickOptimizerPatch
             Godot.GD.PrintErr("[ClickOptimizer] FAILED to find NMouseCardPlay.Start");
         }
 
-        // --- Patch 2: NMouseCardPlay._Input() — click detection for last-target feature ---
+        // --- Patch 2: NMouseCardPlay._Input() — click/gamepad detection for auto-target ---
         var inputMethod = AccessTools.Method(mousePlayType, "_Input");
         if (inputMethod != null)
         {
@@ -122,33 +122,89 @@ internal static class ClickOptimizerPatch
     {
         try
         {
-            if (inputEvent is not InputEventMouseButton { ButtonIndex: MouseButton.Left } mouseEvent)
-                return true;
-            if (!mouseEvent.IsReleased())
-                return true;
-
-            var holder = __instance.Holder;
-            var card = holder?.CardModel;
-            if (card == null || card.TargetType != TargetType.AnyEnemy)
-                return true;
-
-            var combatRoom = NCombatRoom.Instance;
-            if (combatRoom == null) return true;
-
-            var viewport = AccessTools.Field(typeof(NCardPlay), "_viewport")?.GetValue(__instance) as Viewport;
-            var mouseY = viewport?.GetMousePosition().Y ?? 0f;
-            var screenHeight = viewport?.GetVisibleRect().Size.Y ?? 1080f;
-            if (mouseY < screenHeight * 0.75f)
-                return true;
-
-            var cts = _ctsField?.GetValue(__instance) as CancellationTokenSource;
-            cts?.Cancel();
-
-            var lastTarget = combatRoom.LastTargetedCreature;
-            if (lastTarget != null && lastTarget.IsAlive)
+            // --- Mouse click (release) in play zone: auto-target last target ---
+            if (inputEvent is InputEventMouseButton { ButtonIndex: MouseButton.Left } mouseEvent)
             {
-                TryPlayCard(__instance, lastTarget);
-                return false;
+                if (!mouseEvent.IsReleased())
+                    return true;
+
+                var holder = __instance.Holder;
+                var card = holder?.CardModel;
+                if (card == null || card.TargetType != TargetType.AnyEnemy)
+                    return true;
+
+                var combatRoom = NCombatRoom.Instance;
+                if (combatRoom == null) return true;
+
+                var viewport = AccessTools.Field(typeof(NCardPlay), "_viewport")?.GetValue(__instance) as Viewport;
+                var mouseY = viewport?.GetMousePosition().Y ?? 0f;
+                var screenHeight = viewport?.GetVisibleRect().Size.Y ?? 1080f;
+                if (mouseY < screenHeight * 0.75f)
+                    return true;
+
+                var lastTarget = combatRoom.LastTargetedCreature;
+                if (lastTarget != null && lastTarget.IsAlive)
+                {
+                    var cts = _ctsField?.GetValue(__instance) as CancellationTokenSource;
+                    cts?.Cancel();
+                    TryPlayCard(__instance, lastTarget);
+                    return false;
+                }
+
+                return true;
+            }
+
+            // --- Gamepad A button: auto-target while holding a card ---
+            if (inputEvent is InputEventJoypadButton { ButtonIndex: JoyButton.A, Pressed: true })
+            {
+                var holder = __instance.Holder;
+                var card = holder?.CardModel;
+                if (card == null) return true;
+
+                var combatRoom = NCombatRoom.Instance;
+                if (combatRoom == null) return true;
+
+                var targetType = card.TargetType;
+
+                // Only auto-target for creature-targeting cards
+                if (targetType != TargetType.AnyEnemy && targetType != TargetType.AnyAlly)
+                    return true;
+
+                Creature? target = null;
+
+                if (targetType == TargetType.AnyEnemy)
+                {
+                    var aliveEnemies = combatRoom.CreatureNodes
+                        .Where(n => n.Entity.IsAlive && !n.Entity.IsPlayer)
+                        .Select(n => n.Entity).ToList();
+
+                    if (aliveEnemies.Count == 1)
+                    {
+                        target = aliveEnemies[0];
+                    }
+                    else if (aliveEnemies.Count > 1)
+                    {
+                        var lastTarget = combatRoom.LastTargetedCreature;
+                        if (lastTarget != null && lastTarget.IsAlive)
+                            target = lastTarget;
+                    }
+                }
+                else if (targetType == TargetType.AnyAlly)
+                {
+                    var aliveAllies = combatRoom.CreatureNodes
+                        .Where(n => n.Entity.IsAlive && n.Entity.IsPlayer)
+                        .Select(n => n.Entity).ToList();
+                    if (aliveAllies.Count == 1)
+                        target = aliveAllies[0];
+                }
+
+                if (target != null)
+                {
+                    var cts = _ctsField?.GetValue(__instance) as CancellationTokenSource;
+                    cts?.Cancel();
+                    TryPlayCard(__instance, target);
+                    return false;
+                }
             }
 
             return true;
