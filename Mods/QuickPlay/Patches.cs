@@ -23,9 +23,12 @@ internal static class ClickOptimizerPatch
 
     public static void Apply(Harmony harmony)
     {
-        // --- Patch 1: NMouseCardPlay.Start() — single enemy & non-targeting auto-play ---
         var mousePlayType = AccessTools.TypeByName(
             "MegaCrit.Sts2.Core.Nodes.Combat.NMouseCardPlay");
+        var controllerPlayType = AccessTools.TypeByName(
+            "MegaCrit.Sts2.Core.Nodes.Combat.NControllerCardPlay");
+
+        // --- Patch 1: NMouseCardPlay.Start() — single enemy & non-targeting auto-play (mouse) ---
         var startMethod = AccessTools.Method(mousePlayType, "Start");
         if (startMethod != null)
         {
@@ -38,7 +41,7 @@ internal static class ClickOptimizerPatch
             Godot.GD.PrintErr("[ClickOptimizer] FAILED to find NMouseCardPlay.Start");
         }
 
-        // --- Patch 2: NMouseCardPlay._Input() — click/gamepad detection for auto-target ---
+        // --- Patch 2: NMouseCardPlay._Input() — click detection for last-target feature ---
         var inputMethod = AccessTools.Method(mousePlayType, "_Input");
         if (inputMethod != null)
         {
@@ -47,7 +50,29 @@ internal static class ClickOptimizerPatch
             Godot.GD.Print("[ClickOptimizer] Patched NMouseCardPlay._Input");
         }
 
-        // --- Patch 3: NPotionPopup.OnUseButtonPressed() — skip targeting when single target ---
+        // --- Patch 3: NControllerCardPlay.Start() — auto-target for gamepad card play ---
+        var ctrlStartMethod = AccessTools.Method(controllerPlayType, "Start");
+        if (ctrlStartMethod != null)
+        {
+            harmony.Patch(ctrlStartMethod,
+                prefix: new HarmonyMethod(typeof(ClickOptimizerPatch), nameof(ControllerStartPrefix)));
+            Godot.GD.Print("[ClickOptimizer] Patched NControllerCardPlay.Start");
+        }
+        else
+        {
+            Godot.GD.PrintErr("[ClickOptimizer] FAILED to find NControllerCardPlay.Start");
+        }
+
+        // --- Patch 4: NControllerCardPlay._Input() — gamepad auto-confirm for last-target ---
+        var ctrlInputMethod = AccessTools.Method(controllerPlayType, "_Input");
+        if (ctrlInputMethod != null)
+        {
+            harmony.Patch(ctrlInputMethod,
+                prefix: new HarmonyMethod(typeof(ClickOptimizerPatch), nameof(ControllerInputPrefix)));
+            Godot.GD.Print("[ClickOptimizer] Patched NControllerCardPlay._Input");
+        }
+
+        // --- Patch 5: NPotionPopup.OnUseButtonPressed() — skip targeting when single target ---
         var popupType = AccessTools.TypeByName(
             "MegaCrit.Sts2.Core.Nodes.Potions.NPotionPopup");
         var useMethod = AccessTools.Method(popupType, "OnUseButtonPressed");
@@ -122,89 +147,33 @@ internal static class ClickOptimizerPatch
     {
         try
         {
-            // --- Mouse click (release) in play zone: auto-target last target ---
-            if (inputEvent is InputEventMouseButton { ButtonIndex: MouseButton.Left } mouseEvent)
-            {
-                if (!mouseEvent.IsReleased())
-                    return true;
-
-                var holder = __instance.Holder;
-                var card = holder?.CardModel;
-                if (card == null || card.TargetType != TargetType.AnyEnemy)
-                    return true;
-
-                var combatRoom = NCombatRoom.Instance;
-                if (combatRoom == null) return true;
-
-                var viewport = AccessTools.Field(typeof(NCardPlay), "_viewport")?.GetValue(__instance) as Viewport;
-                var mouseY = viewport?.GetMousePosition().Y ?? 0f;
-                var screenHeight = viewport?.GetVisibleRect().Size.Y ?? 1080f;
-                if (mouseY < screenHeight * 0.75f)
-                    return true;
-
-                var lastTarget = combatRoom.LastTargetedCreature;
-                if (lastTarget != null && lastTarget.IsAlive)
-                {
-                    var cts = _ctsField?.GetValue(__instance) as CancellationTokenSource;
-                    cts?.Cancel();
-                    TryPlayCard(__instance, lastTarget);
-                    return false;
-                }
-
+            // Mouse click (release) in play zone: auto-target last target
+            if (inputEvent is not InputEventMouseButton { ButtonIndex: MouseButton.Left } mouseEvent)
                 return true;
-            }
+            if (!mouseEvent.IsReleased())
+                return true;
 
-            // --- Gamepad A button: auto-target while holding a card ---
-            if (inputEvent is InputEventJoypadButton { ButtonIndex: JoyButton.A, Pressed: true })
+            var holder = __instance.Holder;
+            var card = holder?.CardModel;
+            if (card == null || card.TargetType != TargetType.AnyEnemy)
+                return true;
+
+            var combatRoom = NCombatRoom.Instance;
+            if (combatRoom == null) return true;
+
+            var viewport = AccessTools.Field(typeof(NCardPlay), "_viewport")?.GetValue(__instance) as Viewport;
+            var mouseY = viewport?.GetMousePosition().Y ?? 0f;
+            var screenHeight = viewport?.GetVisibleRect().Size.Y ?? 1080f;
+            if (mouseY < screenHeight * 0.75f)
+                return true;
+
+            var lastTarget = combatRoom.LastTargetedCreature;
+            if (lastTarget != null && lastTarget.IsAlive)
             {
-                var holder = __instance.Holder;
-                var card = holder?.CardModel;
-                if (card == null) return true;
-
-                var combatRoom = NCombatRoom.Instance;
-                if (combatRoom == null) return true;
-
-                var targetType = card.TargetType;
-
-                // Only auto-target for creature-targeting cards
-                if (targetType != TargetType.AnyEnemy && targetType != TargetType.AnyAlly)
-                    return true;
-
-                Creature? target = null;
-
-                if (targetType == TargetType.AnyEnemy)
-                {
-                    var aliveEnemies = combatRoom.CreatureNodes
-                        .Where(n => n.Entity.IsAlive && !n.Entity.IsPlayer)
-                        .Select(n => n.Entity).ToList();
-
-                    if (aliveEnemies.Count == 1)
-                    {
-                        target = aliveEnemies[0];
-                    }
-                    else if (aliveEnemies.Count > 1)
-                    {
-                        var lastTarget = combatRoom.LastTargetedCreature;
-                        if (lastTarget != null && lastTarget.IsAlive)
-                            target = lastTarget;
-                    }
-                }
-                else if (targetType == TargetType.AnyAlly)
-                {
-                    var aliveAllies = combatRoom.CreatureNodes
-                        .Where(n => n.Entity.IsAlive && n.Entity.IsPlayer)
-                        .Select(n => n.Entity).ToList();
-                    if (aliveAllies.Count == 1)
-                        target = aliveAllies[0];
-                }
-
-                if (target != null)
-                {
-                    var cts = _ctsField?.GetValue(__instance) as CancellationTokenSource;
-                    cts?.Cancel();
-                    TryPlayCard(__instance, target);
-                    return false;
-                }
+                var cts = _ctsField?.GetValue(__instance) as CancellationTokenSource;
+                cts?.Cancel();
+                TryPlayCard(__instance, lastTarget);
+                return false;
             }
 
             return true;
@@ -212,6 +181,104 @@ internal static class ClickOptimizerPatch
         catch (Exception ex)
         {
             Godot.GD.PrintErr($"[ClickOptimizer] InputPrefix error: {ex.Message}");
+            return true;
+        }
+    }
+
+    /// <summary>
+    /// Prefix on NControllerCardPlay.Start().
+    /// Same auto-target logic as the mouse version, but for gamepad card play.
+    /// </summary>
+    public static bool ControllerStartPrefix(NCardPlay __instance)
+    {
+        try
+        {
+            var holder = __instance.Holder;
+            var card = holder?.CardModel;
+            if (card == null) return true;
+
+            var combatRoom = NCombatRoom.Instance;
+            if (combatRoom == null) return true;
+
+            var targetType = card.TargetType;
+
+            if (targetType == TargetType.AnyAlly)
+            {
+                var aliveAllies = combatRoom.CreatureNodes
+                    .Where(n => n.Entity.IsAlive && n.Entity.IsPlayer)
+                    .Select(n => n.Entity).ToList();
+                if (aliveAllies.Count == 1)
+                {
+                    TryPlayCard(__instance, aliveAllies[0]);
+                    return false;
+                }
+                return true;
+            }
+
+            if (targetType == TargetType.AnyEnemy)
+            {
+                var aliveEnemies = combatRoom.CreatureNodes
+                    .Where(n => n.Entity.IsAlive && !n.Entity.IsPlayer)
+                    .Select(n => n.Entity).ToList();
+                if (aliveEnemies.Count == 1)
+                {
+                    TryPlayCard(__instance, aliveEnemies[0]);
+                    return false;
+                }
+
+                // Multiple enemies: check last target
+                var lastTarget = combatRoom.LastTargetedCreature;
+                if (lastTarget != null && lastTarget.IsAlive)
+                {
+                    TryPlayCard(__instance, lastTarget);
+                    return false;
+                }
+
+                return true;
+            }
+
+            TryPlayCard(__instance, null);
+            return false;
+        }
+        catch (Exception ex)
+        {
+            Godot.GD.PrintErr($"[ClickOptimizer] ControllerStartPrefix error: {ex.Message}");
+            return true;
+        }
+    }
+
+    /// <summary>
+    /// Prefix on NControllerCardPlay._Input().
+    /// When gamepad A is pressed during targeting and there's a valid last target,
+    /// auto-confirm on that target.
+    /// </summary>
+    public static bool ControllerInputPrefix(NCardPlay __instance, InputEvent inputEvent)
+    {
+        try
+        {
+            // Only intercept gamepad A button presses
+            if (inputEvent is not InputEventJoypadButton { ButtonIndex: JoyButton.A, Pressed: true })
+                return true;
+
+            var card = __instance.Holder?.CardModel;
+            if (card == null || card.TargetType != TargetType.AnyEnemy)
+                return true;
+
+            var combatRoom = NCombatRoom.Instance;
+            if (combatRoom == null) return true;
+
+            var lastTarget = combatRoom.LastTargetedCreature;
+            if (lastTarget != null && lastTarget.IsAlive)
+            {
+                TryPlayCard(__instance, lastTarget);
+                return false;
+            }
+
+            return true;
+        }
+        catch (Exception ex)
+        {
+            Godot.GD.PrintErr($"[ClickOptimizer] ControllerInputPrefix error: {ex.Message}");
             return true;
         }
     }
