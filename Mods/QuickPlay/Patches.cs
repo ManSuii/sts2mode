@@ -7,6 +7,7 @@ using Godot;
 using MegaCrit.Sts2.Core.Entities.Creatures;
 using MegaCrit.Sts2.Core.Entities.Cards;
 using MegaCrit.Sts2.Core.Models;
+using MegaCrit.Sts2.Core.Nodes.Cards.Holders;
 using MegaCrit.Sts2.Core.Nodes.Combat;
 using MegaCrit.Sts2.Core.Nodes.Rooms;
 using MegaCrit.Sts2.Core.Nodes.Potions;
@@ -63,16 +64,57 @@ internal static class ClickOptimizerPatch
             Godot.GD.PrintErr("[ClickOptimizer] FAILED to find NControllerCardPlay.Start");
         }
 
-        // --- Patch 4: NControllerCardPlay._Input() — gamepad auto-confirm for last-target ---
-        var ctrlInputMethod = AccessTools.Method(controllerPlayType, "_Input");
-        if (ctrlInputMethod != null)
+        // --- Patch 4: NPlayerHand focus events — automatic target preview ---
+        var playerHandType = AccessTools.TypeByName(
+            "MegaCrit.Sts2.Core.Nodes.Combat.NPlayerHand");
+        var holderFocusedMethod = AccessTools.Method(playerHandType, "OnHolderFocused");
+        if (holderFocusedMethod != null)
         {
-            harmony.Patch(ctrlInputMethod,
-                prefix: new HarmonyMethod(typeof(ClickOptimizerPatch), nameof(ControllerInputPrefix)));
-            Godot.GD.Print("[ClickOptimizer] Patched NControllerCardPlay._Input");
+            harmony.Patch(holderFocusedMethod,
+                postfix: new HarmonyMethod(typeof(ClickOptimizerPatch), nameof(HolderFocusedPostfix)));
+            Godot.GD.Print("[ClickOptimizer] Patched NPlayerHand.OnHolderFocused");
         }
 
-        // --- Patch 5: NPotionPopup.OnUseButtonPressed() — skip targeting when single target ---
+        var holderUnfocusedMethod = AccessTools.Method(playerHandType, "OnHolderUnfocused");
+        if (holderUnfocusedMethod != null)
+        {
+            harmony.Patch(holderUnfocusedMethod,
+                postfix: new HarmonyMethod(typeof(ClickOptimizerPatch), nameof(HolderUnfocusedPostfix)));
+            Godot.GD.Print("[ClickOptimizer] Patched NPlayerHand.OnHolderUnfocused");
+        }
+
+        // --- Patch 5: NCardPlay hover events — manual target selection takes priority ---
+        var creatureHoverMethod = AccessTools.Method(typeof(NCardPlay), "OnCreatureHover");
+        if (creatureHoverMethod != null)
+        {
+            harmony.Patch(creatureHoverMethod,
+                prefix: new HarmonyMethod(typeof(ClickOptimizerPatch), nameof(CardHoverPrefix)));
+            Godot.GD.Print("[ClickOptimizer] Patched NCardPlay.OnCreatureHover");
+        }
+
+        var creatureUnhoverMethod = AccessTools.Method(typeof(NCardPlay), "OnCreatureUnhover");
+        if (creatureUnhoverMethod != null)
+        {
+            harmony.Patch(creatureUnhoverMethod,
+                postfix: new HarmonyMethod(typeof(ClickOptimizerPatch), nameof(CardUnhoverPostfix)));
+            Godot.GD.Print("[ClickOptimizer] Patched NCardPlay.OnCreatureUnhover");
+        }
+
+        var cleanupMethod = AccessTools.Method(typeof(NCardPlay), "Cleanup");
+        if (cleanupMethod != null)
+        {
+            harmony.Patch(cleanupMethod,
+                postfix: new HarmonyMethod(typeof(ClickOptimizerPatch), nameof(CardPlayCleanupPostfix)));
+        }
+
+        var cancelCardPlayMethod = AccessTools.Method(typeof(NCardPlay), "OnCancelPlayCard");
+        if (cancelCardPlayMethod != null)
+        {
+            harmony.Patch(cancelCardPlayMethod,
+                postfix: new HarmonyMethod(typeof(ClickOptimizerPatch), nameof(CardPlayCleanupPostfix)));
+        }
+
+        // --- Patch 6: NPotionPopup.OnUseButtonPressed() — skip targeting when single target ---
         var popupType = AccessTools.TypeByName(
             "MegaCrit.Sts2.Core.Nodes.Potions.NPotionPopup");
         var useMethod = AccessTools.Method(popupType, "OnUseButtonPressed");
@@ -85,6 +127,34 @@ internal static class ClickOptimizerPatch
         else
         {
             Godot.GD.PrintErr("[ClickOptimizer] FAILED to find NPotionPopup.OnUseButtonPressed");
+        }
+
+        var popupExitMethod = AccessTools.Method(popupType, "_ExitTree");
+        if (popupExitMethod != null)
+        {
+            harmony.Patch(popupExitMethod,
+                postfix: new HarmonyMethod(typeof(ClickOptimizerPatch), nameof(PotionPopupExitPostfix)));
+        }
+
+        // --- Patch 7: NPotionHolder.OpenPotionPopup() — preview the automatic potion target ---
+        var potionHolderType = AccessTools.TypeByName(
+            "MegaCrit.Sts2.Core.Nodes.Potions.NPotionHolder");
+        var openPopupMethod = AccessTools.Method(potionHolderType, "OpenPotionPopup");
+        if (openPopupMethod != null)
+        {
+            harmony.Patch(openPopupMethod,
+                prefix: new HarmonyMethod(typeof(ClickOptimizerPatch), nameof(PotionOpenPrefix)),
+                postfix: new HarmonyMethod(typeof(ClickOptimizerPatch), nameof(PotionOpenedPostfix)));
+        }
+
+        // --- Patch 8: NTargetManager._Input() — track mouse vs controller input ---
+        var targetManagerType = AccessTools.TypeByName(
+            "MegaCrit.Sts2.Core.Nodes.Combat.NTargetManager");
+        var targetManagerInputMethod = AccessTools.Method(targetManagerType, "_Input");
+        if (targetManagerInputMethod != null)
+        {
+            harmony.Patch(targetManagerInputMethod,
+                prefix: new HarmonyMethod(typeof(ClickOptimizerPatch), nameof(TargetManagerInputPrefix)));
         }
 
         // Cache accessed members
@@ -114,25 +184,29 @@ internal static class ClickOptimizerPatch
                     .Select(n => n.Entity).ToList();
                 if (aliveAllies.Count == 1)
                 {
+                    AutomaticTargetPreview.BeginCardPlay(card, aliveAllies[0]);
                     TryPlayCard(__instance, aliveAllies[0]);
                     return false;
                 }
+                AutomaticTargetPreview.ClearCard(card);
                 return true;
             }
 
             if (targetType == TargetType.AnyEnemy)
             {
                 var aliveEnemies = combatRoom.CreatureNodes
-                    .Where(n => n.Entity.IsAlive && !n.Entity.IsPlayer)
+                    .Where(n => n.Entity.IsAlive && n.Entity.IsEnemy)
                     .Select(n => n.Entity).ToList();
                 if (aliveEnemies.Count == 1)
                 {
+                    AutomaticTargetPreview.BeginCardPlay(card, aliveEnemies[0]);
                     TryPlayCard(__instance, aliveEnemies[0]);
                     return false;
                 }
                 return true;
             }
 
+            AutomaticTargetPreview.ClearCard(card);
             TryPlayCard(__instance, null);
             return false;
         }
@@ -172,6 +246,7 @@ internal static class ClickOptimizerPatch
             {
                 var cts = _ctsField?.GetValue(__instance) as CancellationTokenSource;
                 cts?.Cancel();
+                AutomaticTargetPreview.BeginCardPlay(card, lastTarget);
                 TryPlayCard(__instance, lastTarget);
                 return false;
             }
@@ -209,76 +284,36 @@ internal static class ClickOptimizerPatch
                     .Select(n => n.Entity).ToList();
                 if (aliveAllies.Count == 1)
                 {
+                    AutomaticTargetPreview.BeginCardPlay(card, aliveAllies[0]);
                     TryPlayCard(__instance, aliveAllies[0]);
                     return false;
                 }
+                AutomaticTargetPreview.ClearCard(card);
                 return true;
             }
 
             if (targetType == TargetType.AnyEnemy)
             {
                 var aliveEnemies = combatRoom.CreatureNodes
-                    .Where(n => n.Entity.IsAlive && !n.Entity.IsPlayer)
+                    .Where(n => n.Entity.IsAlive && n.Entity.IsEnemy)
                     .Select(n => n.Entity).ToList();
                 if (aliveEnemies.Count == 1)
                 {
+                    AutomaticTargetPreview.BeginCardPlay(card, aliveEnemies[0]);
                     TryPlayCard(__instance, aliveEnemies[0]);
                     return false;
                 }
-
-                // Multiple enemies: check last target
-                var lastTarget = combatRoom.LastTargetedCreature;
-                if (lastTarget != null && lastTarget.IsAlive)
-                {
-                    TryPlayCard(__instance, lastTarget);
-                    return false;
-                }
-
+                AutomaticTargetPreview.ClearCard(card);
                 return true;
             }
 
+            AutomaticTargetPreview.ClearCard(card);
             TryPlayCard(__instance, null);
             return false;
         }
         catch (Exception ex)
         {
             Godot.GD.PrintErr($"[ClickOptimizer] ControllerStartPrefix error: {ex.Message}");
-            return true;
-        }
-    }
-
-    /// <summary>
-    /// Prefix on NControllerCardPlay._Input().
-    /// When gamepad A is pressed during targeting and there's a valid last target,
-    /// auto-confirm on that target.
-    /// </summary>
-    public static bool ControllerInputPrefix(NCardPlay __instance, InputEvent inputEvent)
-    {
-        try
-        {
-            // Only intercept gamepad A button presses
-            if (inputEvent is not InputEventJoypadButton { ButtonIndex: JoyButton.A, Pressed: true })
-                return true;
-
-            var card = __instance.Holder?.CardModel;
-            if (card == null || card.TargetType != TargetType.AnyEnemy)
-                return true;
-
-            var combatRoom = NCombatRoom.Instance;
-            if (combatRoom == null) return true;
-
-            var lastTarget = combatRoom.LastTargetedCreature;
-            if (lastTarget != null && lastTarget.IsAlive)
-            {
-                TryPlayCard(__instance, lastTarget);
-                return false;
-            }
-
-            return true;
-        }
-        catch (Exception ex)
-        {
-            Godot.GD.PrintErr($"[ClickOptimizer] ControllerInputPrefix error: {ex.Message}");
             return true;
         }
     }
@@ -309,9 +344,28 @@ internal static class ClickOptimizerPatch
             var combatRoom = NCombatRoom.Instance;
             var targetType = potion.TargetType;
 
-            // --- Self -> already handled by the game, let normal flow go ---
-            if (targetType == TargetType.Self)
+            // --- Self and single-player AnyPlayer potions use the owner directly ---
+            if (targetType is TargetType.Self or TargetType.AnyPlayer)
+            {
+                var category = targetType == TargetType.Self
+                    ? PotionTargetCategory.Self
+                    : PotionTargetCategory.AnyPlayer;
+                var decision = PotionUsePolicy.Decide(
+                    category,
+                    targetType == TargetType.AnyPlayer && potion.CanThrowAtAlly());
+                var ownerCreature = potion.Owner?.Creature;
+
+                if (decision.Mode == PotionUseMode.UseImmediately &&
+                    decision.Target == PotionUseTarget.Owner &&
+                    ownerCreature != null)
+                {
+                    AutomaticTargetPreview.BeginPotionPlay(potion, ownerCreature);
+                    potion.EnqueueManualUse(ownerCreature);
+                    return false;
+                }
+
                 return true;
+            }
 
             // For creature-dependent potions, need combat room
             if (combatRoom == null) return true;
@@ -320,30 +374,18 @@ internal static class ClickOptimizerPatch
             if (targetType == TargetType.AnyEnemy)
             {
                 var aliveEnemies = combatRoom.CreatureNodes
-                    .Where(n => n.Entity.IsAlive && !n.Entity.IsPlayer)
+                    .Where(n => n.Entity.IsAlive && n.Entity.IsEnemy)
                     .Select(n => n.Entity).ToList();
 
                 if (aliveEnemies.Count == 1)
                 {
+                    AutomaticTargetPreview.BeginPotionPlay(potion, aliveEnemies[0]);
                     potion.EnqueueManualUse(aliveEnemies[0]);
                     return false;
                 }
                 return true;
             }
 
-            // --- CanThrowAtAlly potions -> single player = use on self ---
-            if (potion.CanThrowAtAlly())
-            {
-                var aliveAllies = combatRoom.CreatureNodes
-                    .Where(n => n.Entity.IsAlive && n.Entity.IsPlayer)
-                    .Select(n => n.Entity).ToList();
-
-                if (aliveAllies.Count == 1)
-                {
-                    potion.EnqueueManualUse(aliveAllies[0]);
-                    return false;
-                }
-            }
         }
         catch (Exception ex)
         {
@@ -351,6 +393,62 @@ internal static class ClickOptimizerPatch
         }
 
         return true; // normal targeting flow
+    }
+
+    public static void HolderFocusedPostfix(NHandCardHolder holder)
+    {
+        AutomaticTargetPreview.BeginCardFocus(holder.CardModel);
+    }
+
+    public static void HolderUnfocusedPostfix(NHandCardHolder holder)
+    {
+        AutomaticTargetPreview.EndCardFocus(holder.CardModel);
+    }
+
+    public static void CardHoverPrefix()
+    {
+        AutomaticTargetPreview.BeginManualTarget();
+    }
+
+    public static void CardUnhoverPostfix()
+    {
+        AutomaticTargetPreview.EndManualTarget();
+    }
+
+    public static void CardPlayCleanupPostfix()
+    {
+        AutomaticTargetPreview.ClearCard();
+    }
+
+    public static void PotionOpenedPostfix(NPotionHolder __instance)
+    {
+        AutomaticTargetPreview.BeginPotionFocus(__instance.Potion?.Model);
+    }
+
+    public static bool PotionOpenPrefix(NPotionHolder __instance)
+    {
+        var potion = __instance.Potion?.Model;
+        if (potion == null)
+            return true;
+
+        var target = AutomaticTargetPreview.ResolvePotionTarget(potion, NCombatRoom.Instance);
+        if (target == null)
+            return true;
+
+        AutomaticTargetPreview.BeginPotionPlay(potion, target);
+        potion.EnqueueManualUse(target);
+        return false;
+    }
+
+    public static void PotionPopupExitPostfix()
+    {
+        AutomaticTargetPreview.ClearPotion();
+    }
+
+    public static bool TargetManagerInputPrefix(InputEvent inputEvent)
+    {
+        AutomaticTargetPreview.TrackInput(inputEvent);
+        return true;
     }
 
     private static void TryPlayCard(NCardPlay instance, Creature? target)
